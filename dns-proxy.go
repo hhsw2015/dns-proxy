@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -359,6 +360,7 @@ func (lm *LogManager) broadcastDNSLog(log DNSLog) {
 			"dnsQueries":     atomic.LoadInt64(&lm.metrics.dnsQueries),
 			"dnsIntercepted": atomic.LoadInt64(&lm.metrics.dnsIntercepted),
 			"proxyConns":     atomic.LoadInt32(&lm.metrics.proxyConns),
+			"proxyForwarded": atomic.LoadInt64(&lm.metrics.proxyForwarded),
 			"proxySocks5":    atomic.LoadInt64(&lm.metrics.proxySocks5),
 		},
 		"config": lm.getProxyConfig(),
@@ -388,6 +390,36 @@ func (lm *LogManager) broadcastProxyLog(log ProxyLog) {
 			"dnsQueries":     atomic.LoadInt64(&lm.metrics.dnsQueries),
 			"dnsIntercepted": atomic.LoadInt64(&lm.metrics.dnsIntercepted),
 			"proxyConns":     atomic.LoadInt32(&lm.metrics.proxyConns),
+			"proxyForwarded": atomic.LoadInt64(&lm.metrics.proxyForwarded),
+			"proxySocks5":    atomic.LoadInt64(&lm.metrics.proxySocks5),
+		},
+		"config": lm.getProxyConfig(),
+	}
+
+	data, err := json.Marshal(message)
+	if err != nil {
+		return
+	}
+
+	for ws := range lm.wsClients {
+		if err := websocket.Message.Send(ws, string(data)); err != nil {
+			// 发送失败，稍后会被清理
+		}
+	}
+}
+
+// BroadcastConfigUpdate 广播配置更新到所有客户端
+func (lm *LogManager) BroadcastConfigUpdate() {
+	lm.wsMu.RLock()
+	defer lm.wsMu.RUnlock()
+
+	message := map[string]interface{}{
+		"type": "config",
+		"stats": map[string]interface{}{
+			"dnsQueries":     atomic.LoadInt64(&lm.metrics.dnsQueries),
+			"dnsIntercepted": atomic.LoadInt64(&lm.metrics.dnsIntercepted),
+			"proxyConns":     atomic.LoadInt32(&lm.metrics.proxyConns),
+			"proxyForwarded": atomic.LoadInt64(&lm.metrics.proxyForwarded),
 			"proxySocks5":    atomic.LoadInt64(&lm.metrics.proxySocks5),
 		},
 		"config": lm.getProxyConfig(),
@@ -912,6 +944,147 @@ func (rm *RuleManager) SavePatterns(content string) error {
 	return rm.Reload()
 }
 
+// MergeAndSavePatterns 合并新规则并保存
+func (rm *RuleManager) MergeAndSavePatterns(newPatterns []string) error {
+	rm.patternsMu.Lock()
+	defer rm.patternsMu.Unlock()
+
+	// 使用 map 去重
+	seen := make(map[string]struct{})
+	for _, p := range rm.patterns {
+		seen[p] = struct{}{}
+	}
+
+	var added int
+	for _, p := range newPatterns {
+		if _, exists := seen[p]; !exists {
+			seen[p] = struct{}{}
+			rm.patterns = append(rm.patterns, p)
+			added++
+		}
+	}
+
+	// 排序
+	sort.Strings(rm.patterns)
+
+	// 保存到文件
+	content := strings.Join(rm.patterns, "\n")
+	if err := os.WriteFile(rm.filePath, []byte(content), 0644); err != nil {
+		return err
+	}
+
+	log.Printf("[RuleManager] 合并完成: 新增 %d 条规则，总计 %d 条", added, len(rm.patterns))
+	return nil
+}
+
+func (rm *RuleManager) UpdateFromURL(rawURL string) error {
+	resp, err := http.Get(rawURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("获取失败，状态码: %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	patterns, err := parseGFWListBytes(body)
+	if err != nil {
+		return err
+	}
+	return rm.MergeAndSavePatterns(patterns)
+}
+
+func fetchViaProxy(proxyStr, targetURL string) ([]byte, error) {
+	if proxyStr == "" {
+		return nil, fmt.Errorf("未配置前置代理")
+	}
+	proxyCfg, err := parseProxyURL(proxyStr)
+	if err != nil {
+		return nil, err
+	}
+	if proxyCfg.Type == "socks5" {
+		u, err := url.Parse(targetURL)
+		if err != nil {
+			return nil, err
+		}
+		host := u.Hostname()
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		conn, err := dialViaSocks5(proxyCfg, host, port)
+		if err != nil {
+			return nil, err
+		}
+		var rw io.ReadWriteCloser = conn
+		if u.Scheme == "https" {
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
+			rw = tlsConn
+		}
+		req, _ := http.NewRequest("GET", u.RequestURI(), nil)
+		req.Host = host
+		req.Header.Set("User-Agent", "dns-proxy")
+		req.Header.Set("Connection", "close")
+		if err := req.Write(rw); err != nil {
+			rw.Close()
+			return nil, err
+		}
+		br := bufio.NewReader(rw)
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			rw.Close()
+			return nil, err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		rw.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("获取失败，状态码: %d", resp.StatusCode)
+		}
+		return body, err
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort(proxyCfg.Host, proxyCfg.Port)}
+	if proxyCfg.Username != "" {
+		proxyURL.User = url.UserPassword(proxyCfg.Username, proxyCfg.Password)
+	}
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+	resp, err := client.Get(targetURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("获取失败，状态码: %d", resp.StatusCode)
+	}
+	return body, err
+}
+
+func (rm *RuleManager) UpdateFromURLViaProxy(proxyStr, rawURL string) error {
+	body, err := fetchViaProxy(proxyStr, rawURL)
+	if err != nil {
+		return err
+	}
+	patterns, err := parseGFWListBytes(body)
+	if err != nil {
+		return err
+	}
+	return rm.MergeAndSavePatterns(patterns)
+}
+
 // ============================================================================
 // DNS 服务相关函数
 // ============================================================================
@@ -1012,34 +1185,95 @@ func parseGFWList(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseGFWListBytes(b)
+}
+
+func parseGFWListBytes(b []byte) ([]string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(string(b))
 	if err != nil {
 		decoded = b
 	}
 	var domains []string
+	seen := make(map[string]struct{})
 	scanner := bufio.NewScanner(bytes.NewReader(decoded))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "!") || strings.HasPrefix(line, "[") {
+		host := extractDomainFromRule(line)
+		if host == "" {
 			continue
 		}
-		line = strings.TrimPrefix(line, "||")
-		line = strings.TrimPrefix(line, "|")
-		line = strings.TrimPrefix(line, ".")
-		if idx := strings.Index(line, "/"); idx != -1 {
-			line = line[:idx]
-		}
-		line = strings.ReplaceAll(line, "*", "")
-		line = strings.ReplaceAll(line, "^", "")
-		if line == "" {
+		if _, ok := seen[host]; ok {
 			continue
 		}
-		domains = append(domains, line)
+		seen[host] = struct{}{}
+		domains = append(domains, host)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 	return domains, nil
+}
+
+var domainRe = regexp.MustCompile(`^([a-zA-Z0-9-]+\.)+[a-zA-Z0-9-]{2,}$`)
+
+func isValidDomain(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	if strings.ContainsAny(s, " \t/[]{}()") {
+		return false
+	}
+	return domainRe.MatchString(s)
+}
+
+func extractDomainFromRule(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return ""
+	}
+	if strings.HasPrefix(line, "!") || strings.HasPrefix(line, "[") {
+		return ""
+	}
+	if strings.HasPrefix(line, "@@") {
+		return ""
+	}
+	if strings.Contains(line, "://") {
+		u, err := url.Parse(line)
+		if err == nil {
+			h := u.Hostname()
+			h = strings.TrimSuffix(h, ".")
+			h = strings.ToLower(h)
+			if isValidDomain(h) {
+				return h
+			}
+		}
+		return ""
+	}
+	line = strings.Trim(line, "|")
+	line = strings.TrimPrefix(line, "||")
+	line = strings.TrimPrefix(line, ".")
+	if idx := strings.Index(line, "/"); idx != -1 {
+		line = line[:idx]
+	}
+	line = strings.ReplaceAll(line, "*", "")
+	line = strings.ReplaceAll(line, "^", "")
+	line = strings.Trim(line, ".")
+	line = strings.ToLower(line)
+	if line == "" || line == "http" || line == "https" {
+		return ""
+	}
+	if strings.Contains(line, ":") {
+		if h, _, err := net.SplitHostPort(line); err == nil {
+			line = h
+		} else {
+			parts := strings.Split(line, ":")
+			line = parts[0]
+		}
+	}
+	if isValidDomain(line) {
+		return line
+	}
+	return ""
 }
 
 // matchDomain 判断域名是否匹配规则
@@ -1750,9 +1984,14 @@ func startWebServer(cfg *Config, sm *ServiceManager) error {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		data, err := os.ReadFile(sm.ruleMgr.filePath)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("读取规则文件失败: " + err.Error()))
-			return
+			if os.IsNotExist(err) {
+				_ = os.WriteFile(sm.ruleMgr.filePath, []byte(""), 0644)
+				data = []byte("")
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("读取规则文件失败: " + err.Error()))
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
@@ -1783,7 +2022,7 @@ body {
 	padding: 20px;
 }
 .container {
-	max-width: 800px;
+	max-width: 1200px;
 	margin: 0 auto;
 	background: white;
 	border-radius: 12px;
@@ -1811,18 +2050,34 @@ body {
 	margin-bottom: 20px;
 	position: relative;
 }
-.search-box input {
+.search-box input[type="text"] {
 	width: 100%%;
-	padding: 12px 40px 12px 15px;
+	padding: 12px 280px 12px 15px;
 	border: 2px solid #e0e0e0;
 	border-radius: 8px;
 	font-size: 15px;
 	transition: all 0.3s;
 }
-.search-box input:focus {
+.search-box input[type="text"]:focus {
 	outline: none;
 	border-color: #27ae60;
 	box-shadow: 0 0 0 3px rgba(39, 174, 96, 0.1);
+}
+.search-option {
+	position: absolute;
+	right: 190px;
+	top: 50%%;
+	transform: translateY(-50%%);
+	font-size: 13px;
+	color: #666;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	user-select: none;
+}
+.search-option input {
+	margin-right: 4px;
+	width: auto;
 }
 .search-icon {
 	position: absolute;
@@ -2261,8 +2516,20 @@ button, .btn {
 
 		<div class="search-box">
 			<input type="text" id="searchInput" placeholder="🔍 输入关键词搜索域名..." autocomplete="off">
+			<label class="search-option">
+				<input type="checkbox" id="exactMatch"> 完全匹配
+			</label>
 			<button type="button" class="btn-add-rule" id="addRuleBtn" onclick="addRuleFromSearch()">➕ 添加</button>
 			<span class="search-icon">⌨️ 清除</span>
+		</div>
+		
+		<div class="editor-container" style="margin-top:10px;">
+			<label for="importUrl">从 URL 导入 gfwlist</label>
+			<input type="text" id="importUrl" class="form-input" placeholder="https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt" value="https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt">
+			<div class="button-group" style="margin-top:10px;">
+				<button type="button" class="btn btn-primary" onclick="importGFWList()">⬇️ 从URL导入</button>
+			</div>
+			<small style="color:#666; font-size:12px;">外部请求将通过已配置的前置代理</small>
 		</div>
 
 		<div class="alert alert-info" id="searchAlert">
@@ -2437,6 +2704,12 @@ function switchMainTab(tabName, evt) {
 		});
 	}
 	document.getElementById(tabName).classList.add('active');
+
+	// 离开统计选项卡时断开 WebSocket
+	if (tabName !== 'stats') {
+		disconnectStatsWebSocket();
+	}
+
 	if (tabName === 'config') {
 		loadConfig();
 		checkServiceStatus();
@@ -2454,6 +2727,7 @@ const searchAlert = document.getElementById('searchAlert');
 const rulesList = document.getElementById('rulesList');
 const editorContainer = document.getElementById('editorContainer');
 const clearSearchButton = document.querySelector('.search-icon');
+const exactMatch = document.getElementById('exactMatch');
 
 let allLines = [];
 let originalContent = textarea.value;
@@ -2466,6 +2740,13 @@ function init() {
 
 if (clearSearchButton) {
 	clearSearchButton.addEventListener('click', clearSearch);
+}
+if (exactMatch) {
+	exactMatch.addEventListener('change', function() {
+		if (searchInput.value.trim() !== '') {
+			searchInput.dispatchEvent(new Event('input'));
+		}
+	});
 }
 
 // 更新统计
@@ -2578,6 +2859,13 @@ function saveRulesToServer() {
 // 搜索防抖
 let searchTimeout = null;
 
+function getFilteredRules(keyword) {
+	if (exactMatch && exactMatch.checked) {
+		return allLines.filter(line => line.toLowerCase() === keyword);
+	}
+	return allLines.filter(line => line.toLowerCase().includes(keyword));
+}
+
 // 搜索功能
 searchInput.addEventListener('input', function() {
 	const keyword = this.value.trim().toLowerCase();
@@ -2600,9 +2888,7 @@ searchInput.addEventListener('input', function() {
 			editorContainer.style.display = 'none';
 			rulesList.classList.add('active');
 
-			const filtered = allLines.filter(line =>
-				line.toLowerCase().includes(keyword)
-			);
+			const filtered = getFilteredRules(keyword);
 
 			// 渲染列表视图
 			renderRulesList(filtered);
@@ -2669,9 +2955,7 @@ function addRuleFromSearch() {
 		if (keyword !== '') {
 			editorContainer.style.display = 'none';
 			rulesList.classList.add('active');
-			const filtered = allLines.filter(line =>
-				line.toLowerCase().includes(keyword.toLowerCase())
-			);
+			const filtered = getFilteredRules(keyword.toLowerCase());
 			renderRulesList(filtered);
 			searchAlert.textContent = '找到 ' + filtered.length + ' 条匹配规则';
 			searchAlert.style.display = 'block';
@@ -2772,7 +3056,13 @@ function deleteRule(rule) {
 	}
 }
 
-// 加载统计数据
+// WebSocket 连接管理
+let statsWs = null;
+let statsReconnectTimer = null;
+let statsDnsLogs = [];
+let statsProxyLogs = [];
+
+// 格式化时间
 function formatTime(timestamp) {
 	const date = new Date(timestamp);
 	return date.toLocaleString('zh-CN', {
@@ -2785,72 +3075,164 @@ function formatTime(timestamp) {
 	});
 }
 
+// 渲染DNS日志
+function renderStatsDNSLogs() {
+	const tbody = document.getElementById('statDnsLogBody');
+	if (!statsDnsLogs || statsDnsLogs.length === 0) {
+		tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">暂无记录</td></tr>';
+		return;
+	}
+	tbody.innerHTML = statsDnsLogs.map(log =>
+		'<tr><td>' + formatTime(log.time) + '</td><td>' + log.domain + '</td><td>' +
+		(log.intercepted ? '<span style="color:#e74c3c">已拦截</span>' : '<span style="color:#27ae60">已放行</span>') +
+		'</td><td>' + log.client_ip + '</td></tr>'
+	).join('');
+}
+
+// 渲染代理日志
+function renderStatsProxyLogs() {
+	const tbody = document.getElementById('statProxyLogBody');
+	if (!statsProxyLogs || statsProxyLogs.length === 0) {
+		tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">暂无记录</td></tr>';
+		return;
+	}
+	tbody.innerHTML = statsProxyLogs.map(log =>
+		'<tr><td>' + formatTime(log.time) + '</td><td>' + log.protocol + '</td><td>' +
+		log.host + '</td><td>' + log.client_ip + '</td><td>' + (log.method || '-') + '</td></tr>'
+	).join('');
+}
+
+// 更新统计数据
+function updateStatsDisplay(stats) {
+	document.getElementById('statDnsQueries').textContent = stats.dnsQueries || 0;
+	document.getElementById('statDnsBlocked').textContent = stats.dnsIntercepted || 0;
+	document.getElementById('statActiveConns').textContent = stats.proxyConns || 0;
+	document.getElementById('statProxyForwards').textContent = stats.proxyForwarded || 0;
+}
+
+// 更新代理配置显示
+function updateStatsConfig(config) {
+	const typeLabel = document.getElementById('statProxyTypeLabel');
+	const statusValue = document.getElementById('statProxyStatusValue');
+
+	// 处理 WebSocket 推送的配置格式
+	if (typeLabel && config.proxyType) {
+		typeLabel.textContent = config.proxyType;
+	}
+	if (statusValue && config.proxyStatus) {
+		statusValue.textContent = config.proxyStatus;
+	}
+}
+
+// 连接统计页面的 WebSocket
+function connectStatsWebSocket() {
+	// 清除重连定时器
+	if (statsReconnectTimer) {
+		clearTimeout(statsReconnectTimer);
+		statsReconnectTimer = null;
+	}
+
+	// 构建 WebSocket URL
+	const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+	const wsUrl = protocol + '//' + window.location.host + '/ws/logs';
+
+	console.log('连接统计 WebSocket:', wsUrl);
+	statsWs = new WebSocket(wsUrl);
+
+	// 连接成功
+	statsWs.onopen = function() {
+		console.log('统计 WebSocket 连接成功');
+	};
+
+	// 接收消息
+	statsWs.onmessage = function(event) {
+		try {
+			const data = JSON.parse(event.data);
+
+			// 更新统计数据
+			if (data.stats) {
+				updateStatsDisplay(data.stats);
+			}
+
+			// 更新配置信息
+			if (data.config) {
+				updateStatsConfig(data.config);
+			}
+
+			// 处理初始化数据
+			if (data.type === 'init') {
+				if (data.data.dns) {
+					statsDnsLogs = data.data.dns.slice(0, 100);
+					renderStatsDNSLogs();
+				}
+				if (data.data.proxy) {
+					statsProxyLogs = data.data.proxy.slice(0, 100);
+					renderStatsProxyLogs();
+				}
+			}
+			// 处理新的 DNS 日志
+			else if (data.type === 'dns') {
+				statsDnsLogs.unshift(data.data);
+				if (statsDnsLogs.length > 100) {
+					statsDnsLogs = statsDnsLogs.slice(0, 100);
+				}
+				renderStatsDNSLogs();
+			}
+			// 处理新的代理日志
+			else if (data.type === 'proxy') {
+				statsProxyLogs.unshift(data.data);
+				if (statsProxyLogs.length > 100) {
+					statsProxyLogs = statsProxyLogs.slice(0, 100);
+				}
+				renderStatsProxyLogs();
+			}
+			// 处理配置更新
+			else if (data.type === 'config') {
+				console.log('收到配置更新');
+			}
+		} catch (error) {
+			console.error('处理 WebSocket 消息失败:', error);
+		}
+	};
+
+	// 连接错误
+	statsWs.onerror = function(error) {
+		console.error('统计 WebSocket 错误:', error);
+	};
+
+	// 连接关闭，5秒后自动重连
+	statsWs.onclose = function() {
+		console.log('统计 WebSocket 连接关闭，5秒后重连...');
+		statsReconnectTimer = setTimeout(connectStatsWebSocket, 5000);
+	};
+}
+
+// 断开统计 WebSocket
+function disconnectStatsWebSocket() {
+	if (statsReconnectTimer) {
+		clearTimeout(statsReconnectTimer);
+		statsReconnectTimer = null;
+	}
+	if (statsWs) {
+		statsWs.close();
+		statsWs = null;
+	}
+}
+
+// 加载统计数据（切换到统计选项卡时调用）
 function loadStatsData() {
-	// 加载统计指标
+	// 加载规则数量
 	fetch('/api/stats')
 		.then(res => res.json())
 		.then(data => {
-			document.getElementById('statDnsQueries').textContent = data.dnsQueries || 0;
-			document.getElementById('statDnsBlocked').textContent = data.dnsBlocked || 0;
-			document.getElementById('statActiveConns').textContent = data.activeConns || 0;
-			document.getElementById('statProxyForwards').textContent = data.proxyForwards || 0;
 			document.getElementById('statRuleCount').textContent = data.ruleCount || 0;
 		})
 		.catch(err => console.error('加载统计数据失败:', err));
 
-	// 加载代理配置
-	fetch('/api/proxy/config')
-		.then(res => res.json())
-		.then(cfg => {
-			const typeLabel = document.getElementById('statProxyTypeLabel');
-			const statusValue = document.getElementById('statProxyStatusValue');
-			const proxyType = cfg.proxyType || cfg.type;
-			const proxyStatus = cfg.proxyStatus || cfg.address;
-			if (proxyType === 'socks5') {
-				typeLabel.textContent = 'SOCKS5 代理';
-			} else if (proxyType === 'http' || proxyType === 'https') {
-				typeLabel.textContent = 'HTTP 代理';
-			} else if (proxyType) {
-				typeLabel.textContent = proxyType;
-			} else {
-				typeLabel.textContent = '代理类型';
-			}
-			statusValue.textContent = proxyStatus || '未配置';
-		})
-		.catch(err => console.error('加载代理配置失败:', err));
-
-	// 加载DNS日志
-	fetch('/api/logs/dns')
-		.then(res => res.json())
-		.then(logs => {
-			const tbody = document.getElementById('statDnsLogBody');
-			if (!logs || logs.length === 0) {
-				tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">暂无记录</td></tr>';
-				return;
-			}
-			tbody.innerHTML = logs.map(log =>
-				'<tr><td>' + formatTime(log.time || log.timestamp) + '</td><td>' + log.domain + '</td><td>' +
-				((log.intercepted || log.blocked) ? '<span style="color:#e74c3c">已拦截</span>' : '<span style="color:#27ae60">已放行</span>') +
-				'</td><td>' + (log.client_ip || log.client || '') + '</td></tr>'
-			).join('');
-		})
-		.catch(err => console.error('加载DNS日志失败:', err));
-
-	// 加载代理日志
-	fetch('/api/logs/proxy')
-		.then(res => res.json())
-		.then(logs => {
-			const tbody = document.getElementById('statProxyLogBody');
-			if (!logs || logs.length === 0) {
-				tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">暂无记录</td></tr>';
-				return;
-			}
-			tbody.innerHTML = logs.map(log =>
-				'<tr><td>' + formatTime(log.time || log.timestamp) + '</td><td>' + log.protocol + '</td><td>' +
-				(log.host || log.target || '') + '</td><td>' + (log.client_ip || log.client || '') + '</td><td>' + (log.method || '-') + '</td></tr>'
-			).join('');
-		})
-		.catch(err => console.error('加载代理日志失败:', err));
+	// 建立 WebSocket 连接以获取实时数据（包括配置信息）
+	if (!statsWs || statsWs.readyState !== WebSocket.OPEN) {
+		connectStatsWebSocket();
+	}
 }
 
 function loadConfig() {
@@ -2976,6 +3358,26 @@ document.getElementById('ruleForm').addEventListener('submit', function(e) {
 
 // 页面加载时初始化
 init();
+
+	function importGFWList() {
+		const url = document.getElementById('importUrl').value.trim();
+		if (!url) {
+			showToast('请输入导入 URL', 'error');
+			return;
+		}
+		fetch('/api/rules/update-gfwlist', {
+			method: 'POST',
+			headers: {'Content-Type': 'application/json'},
+			body: JSON.stringify({url})
+		})
+			.then(res => res.json().then(data => ({ok: res.ok, data})))
+			.then(({ok, data}) => {
+				if (!ok) throw new Error(data.error || '导入失败');
+				showToast('导入成功，规则数：' + data.count, 'success');
+				location.reload();
+			})
+			.catch(err => showToast(err.message, 'error'));
+	}
 </script>
 </body>
 </html>`, len(cleanLines), len(cleanLines), htmlEscape(sortedContent))
@@ -3029,8 +3431,54 @@ init();
 		}
 
 		sm.cfg = &newCfg
+		sm.logMgr.cfg = &newCfg // 同步更新 LogManager 的配置引用
+
+		// 广播配置更新到所有 WebSocket 客户端
+		sm.logMgr.BroadcastConfigUpdate()
+
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"message": "配置已保存"})
+	})
+
+	http.HandleFunc("/api/rules/update-gfwlist", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var payload struct {
+			URL string `json:"url"`
+		}
+		if r.ContentLength > 0 {
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "请求格式错误: " + err.Error()})
+				return
+			}
+		}
+		u := strings.TrimSpace(payload.URL)
+		if u == "" {
+			u = strings.TrimSpace(r.URL.Query().Get("url"))
+		}
+		if u == "" {
+			u = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"
+		}
+		if sm.cfg.Socks5Proxy == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "请先在配置管理中配置前置代理后再导入"})
+			return
+		}
+		if err := sm.ruleMgr.UpdateFromURLViaProxy(sm.cfg.Socks5Proxy, u); err != nil {
+			status := http.StatusInternalServerError
+			if strings.Contains(err.Error(), "未配置前置代理") {
+				status = http.StatusBadRequest
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": "从 gfwlist 更新失败: " + err.Error()})
+			return
+		}
+		pats := sm.ruleMgr.GetPatterns()
+		json.NewEncoder(w).Encode(map[string]interface{}{"message": "已从 gfwlist 更新", "count": len(pats)})
 	})
 
 	// 启动服务
@@ -3227,7 +3675,7 @@ body {
 	padding: 20px;
 }
 .container {
-	max-width: 800px;
+	max-width: 1200px;
 	margin: 0 auto;
 	background: white;
 	border-radius: 12px;
@@ -3540,10 +3988,14 @@ function updateStats(stats) {
 
 	// 按顺序更新：DNS查询、DNS拦截、活跃连接、代理转发次数、规则数量
 	if (metricCards.length >= 5) {
-		metricCards[0].textContent = stats.dnsQueries || 0;
-		metricCards[1].textContent = stats.dnsIntercepted || 0;
-		metricCards[2].textContent = stats.proxyConns || 0;
-		metricCards[3].textContent = (stats.proxyForwarded !== undefined ? stats.proxyForwarded : (stats.proxySocks5 || 0));
+		const dnsQueries = stats.dnsQueries || 0;
+		const dnsIntercepted = (stats.dnsIntercepted !== undefined ? stats.dnsIntercepted : (stats.dnsBlocked || 0));
+		const proxyConns = (stats.proxyConns !== undefined ? stats.proxyConns : (stats.activeConns || 0));
+		const proxyForwarded = (stats.proxyForwarded !== undefined ? stats.proxyForwarded : (stats.proxyForwards !== undefined ? stats.proxyForwards : (stats.proxySocks5 || 0)));
+		metricCards[0].textContent = dnsQueries;
+		metricCards[1].textContent = dnsIntercepted;
+		metricCards[2].textContent = proxyConns;
+		metricCards[3].textContent = proxyForwarded;
 		if (stats.ruleCount !== undefined) {
 			metricCards[4].textContent = stats.ruleCount;
 		}
